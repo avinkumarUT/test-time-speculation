@@ -1,0 +1,7 @@
+# Generated locally; not part of the repository.
+prompts/
+runs/
+__pycache__/
+
+# The shipped raw results are tracked (the repo-wide .gitignore skips *.jsonl).
+!results/**/*.jsonl

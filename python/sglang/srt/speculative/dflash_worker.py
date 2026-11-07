@@ -6,6 +6,7 @@ from typing import Optional, Union
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -20,7 +21,21 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.models import dflash as _dflash_model
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
+from sglang.srt.speculative.accept_log import make_accept_log
+from sglang.srt.speculative.dflash_lora_tts import (
+    DFlashLoRATTSConfig,
+    DFlashLoRATTSState,
+    build_static_lora_buffers,
+    parse_lora_tts_targets,
+)
+from sglang.srt.speculative.dflash_tts import (
+    DFlashBlockForward,
+    DFlashTTSConfig,
+    DFlashTTSState,
+    resolve_lm_head_rows,
+)
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     is_dflash_sampling_verify_available,
@@ -65,6 +80,7 @@ class DFlashWorker:
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
+        self._accept_log = make_accept_log(server_args, tp_rank)
         self.dp_rank = dp_rank
         self.moe_ep_rank = moe_ep_rank
         self.attn_cp_rank = attn_cp_rank
@@ -82,6 +98,7 @@ class DFlashWorker:
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
+        self._warned_lora_tts_lm_head = False
         self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
@@ -130,6 +147,58 @@ class DFlashWorker:
                 _fb,
             )
             draft_backend = _fb
+        # Full-weight TTS (dflash_tts.py). It updates the draft's parameters
+        # in place and in their own dtype, so the draft runner and its CUDA
+        # graphs are set up as without TTS.
+        tts_config = DFlashTTSConfig.from_server_args(server_args)
+        # With TTS, draft layers trained with a sliding window are served
+        # with it (see models/dflash.py).
+        draft_windowed = _dflash_model.draft_window_enabled(server_args)
+        if draft_windowed:
+            # A windowed draft that is captured in CUDA graphs on top of a
+            # hybrid-SWA target is rejected below, because the graph paths
+            # would translate window indices with the target's slot map. The
+            # only exemption is a draft that runs eagerly: TTS with
+            # --speculative-dflash-lora-tts-no-draft-graphs. TTS with draft
+            # graphs (the default) captures the draft and is subject to the
+            # check like any other configuration.
+            _tts_draft_eager = (
+                server_args.speculative_dflash_lora_tts_enable
+                and int(
+                    server_args.speculative_dflash_lora_tts_freq
+                )
+                > 0
+                and not server_args.speculative_dflash_lora_tts_draft_graphs
+            )
+            if (
+                not server_args.disable_cuda_graph
+                and not _tts_draft_eager
+                and hasattr(
+                    target_token_to_kv_pool_allocator,
+                    "translate_loc_from_full_to_swa",
+                )
+            ):
+                # The CUDA-graph window-metadata paths choose the index
+                # translation from the allocator. A graph-captured windowed
+                # draft on a hybrid-SWA target would translate the draft's
+                # full-space indices with the target's map and read wrong
+                # rows once the two slot maps differ.
+                raise RuntimeError(
+                    "DFLASH draft sliding-window mode with CUDA graphs on a "
+                    "hybrid-SWA target would mistranslate window KV indices; "
+                    "pass --disable-cuda-graph."
+                )
+        if draft_windowed and draft_backend != "triton":
+            # The windowed draft path (per-layer sliding_window_size, the
+            # window KV buffers and the full->SWA translation check) is
+            # supported on the triton backend only; the other backends still
+            # choose the window-index translation from the allocator.
+            logger.warning(
+                "DFLASH draft sliding-window mode: forcing draft "
+                "attention_backend 'triton' (was %r).",
+                draft_backend,
+            )
+            draft_backend = "triton"
         # Make the draft worker backend explicit and self-contained (no further overrides).
         draft_server_args.speculative_draft_attention_backend = None
         draft_server_args.prefill_attention_backend = None
@@ -139,6 +208,113 @@ class DFlashWorker:
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
+        self._lora_tts_static_buffers = None
+        self._lora_tts_draft_graphs = False
+        if server_args.speculative_dflash_lora_tts_enable:
+            _tts_freq = int(
+                server_args.speculative_dflash_lora_tts_freq
+            )
+            self._lora_tts_draft_graphs = (
+                bool(
+                    server_args.speculative_dflash_lora_tts_draft_graphs
+                )
+                and _tts_freq > 0
+            )
+            if _tts_freq > 0:
+                # The static adapter buffers are required whenever TTS can
+                # update: the serving hook reads adapters only from them, in
+                # eager and graph mode alike, so without them updates would
+                # never affect drafting. They are built from the draft config
+                # here, before the draft model is constructed, so that
+                # CUDA-graph capture records the delta bmms reading these
+                # fixed tensors. The TTS state cross-checks their shapes
+                # against the loaded modules at init. Failing to build them
+                # is fatal.
+                from transformers import AutoConfig
+
+                _draft_hf_cfg = AutoConfig.from_pretrained(
+                    server_args.speculative_draft_model_path,
+                    revision=getattr(
+                        server_args, "speculative_draft_model_revision", None
+                    ),
+                    trust_remote_code=server_args.trust_remote_code,
+                )
+                _max_bs = (
+                    server_args.max_running_requests
+                    or getattr(draft_server_args, "cuda_graph_max_bs", None)
+                    or 160
+                )
+                if not server_args.max_running_requests and _max_bs > 128:
+                    logger.warning(
+                        "DFlash LoRA-TTS: --max-running-requests is unset; "
+                        "static adapter buffers are sized for bs<=%d "
+                        "(~%d MB/rank). Set --max-running-requests to "
+                        "bound this explicitly.",
+                        min(_max_bs, 256),
+                        # Approximate adapter-buffer size in MB per batch row
+                        # at tp_size 1 (default rank and targets), divided
+                        # across ranks.
+                        min(_max_bs, 256) * 13 // int(server_args.tp_size),
+                    )
+                if _max_bs > 256:
+                    logger.warning(
+                        "DFlash LoRA-TTS: capping static adapter buffers "
+                        "at bs 256 (+8 rows padding; derived %d); the "
+                        "draft's CUDA-graph bucket list is capped to "
+                        "match, so larger batches run the draft eager and "
+                        "serve without adapters (warn-once at runtime).",
+                        _max_bs,
+                    )
+                    _max_bs = 256
+                # Round the buffer cap up to a multiple of 8, plus 8 rows of
+                # headroom for a pool-size capture bucket, and cap the draft's
+                # CUDA-graph batch sizes so that every captured size fits the
+                # buffers.
+                _max_bs = ((int(_max_bs) + 15) // 8) * 8
+                draft_server_args.cuda_graph_max_bs = min(
+                    getattr(draft_server_args, "cuda_graph_max_bs", None)
+                    or _max_bs,
+                    _max_bs,
+                )
+                _bs_list = getattr(
+                    draft_server_args, "cuda_graph_bs", None
+                )
+                if _bs_list:
+                    _capped = [b for b in _bs_list if b <= _max_bs]
+                    if len(_capped) != len(_bs_list):
+                        if not _capped or max(_capped) < _max_bs:
+                            _capped.append(_max_bs)
+                        draft_server_args.cuda_graph_bs = _capped
+                self._lora_tts_static_buffers = build_static_lora_buffers(
+                    draft_hf_config=_draft_hf_cfg,
+                    tp_size=int(server_args.tp_size),
+                    rank=int(server_args.speculative_dflash_lora_tts_rank),
+                    alpha=float(
+                        server_args.speculative_dflash_lora_tts_alpha
+                    ),
+                    targets=parse_lora_tts_targets(
+                        server_args.speculative_dflash_lora_tts_targets
+                    ),
+                    block_size=int(
+                        server_args.speculative_num_draft_tokens
+                    ),
+                    max_bs=int(_max_bs),
+                    dtype=target_worker.model_runner.dtype,
+                    device=torch.device(self.device),
+                    layers_spec=str(
+                        server_args.speculative_dflash_lora_tts_layers
+                        or ""
+                    ),
+                )
+                _dflash_model._set_lora_static(
+                    self._lora_tts_static_buffers
+                )
+                if not self._lora_tts_draft_graphs:
+                    # Eager draft: same static buffers and publish path, no
+                    # graph capture.
+                    draft_server_args.disable_cuda_graph = True
+            # freq <= 0: no buffers are installed and the hook is absent from
+            # the draft graphs, which stay enabled and behave as without TTS.
         saved_server_args = get_global_server_args()
         self.draft_worker = TpModelWorker(
             server_args=draft_server_args,
@@ -231,6 +407,168 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+        # Optional per-request LoRA test-time speculation (dflash_lora_tts.py).
+        self._lora_tts_state: Optional[DFlashLoRATTSState] = None
+        self._lora_tts_round_req_pool_idx_list: Optional[list] = None
+        self._warned_lora_tts_serving_failed = False
+        if server_args.speculative_dflash_lora_tts_enable:
+            if int(self.block_size) < 2:
+                # With block_size 1 there is no draft position to score, so
+                # the loss would be identically zero.
+                raise RuntimeError(
+                    "DFLASH LoRA-TTS requires block_size >= 2, got "
+                    f"{self.block_size}."
+                )
+            target_hf_config = self.target_worker.model_runner.model_config.hf_config
+            logit_softcap = getattr(target_hf_config, "final_logit_softcapping", None)
+            if logit_softcap is None:
+                text_config = getattr(target_hf_config, "text_config", None)
+                logit_softcap = getattr(text_config, "final_logit_softcapping", None)
+            lora_tts_config = DFlashLoRATTSConfig(
+                rank=int(server_args.speculative_dflash_lora_tts_rank),
+                alpha=float(server_args.speculative_dflash_lora_tts_alpha),
+                lr=float(server_args.speculative_dflash_lora_tts_lr),
+                tts_loss=str(server_args.speculative_tts_loss),
+                tts_lambda=float(server_args.speculative_tts_lambda),
+                freq=int(server_args.speculative_dflash_lora_tts_freq),
+                steps=int(server_args.speculative_dflash_lora_tts_steps),
+                pos_weight_gamma=float(
+                    server_args.speculative_dflash_lora_tts_pos_weight_gamma
+                ),
+                grad_clip=float(server_args.speculative_dflash_lora_tts_grad_clip),
+                targets=parse_lora_tts_targets(
+                    server_args.speculative_dflash_lora_tts_targets
+                ),
+                layers_spec=str(
+                    server_args.speculative_dflash_lora_tts_layers
+                    or ""
+                ),
+                # Negative means disabled (LogitsProcessor convention).
+                logit_softcap=(
+                    float(logit_softcap)
+                    if logit_softcap and float(logit_softcap) > 0
+                    else None
+                ),
+                async_step=bool(server_args.speculative_dflash_lora_tts_async),
+                phase_stagger=bool(
+                    server_args.speculative_dflash_lora_tts_phase_stagger
+                ),
+                offload_state=bool(
+                    server_args.speculative_dflash_lora_tts_offload
+                ),
+                delayed_publish=bool(
+                    server_args.speculative_dflash_lora_tts_delayed_publish
+                ),
+                replay_chunk=int(
+                    server_args.speculative_dflash_lora_tts_replay_chunk
+                ),
+                optimizer_dtype=str(
+                    getattr(
+                        server_args,
+                        "speculative_dflash_lora_tts_optimizer_dtype",
+                        "float32",
+                    )
+                ),
+            )
+            self._lora_tts_state = DFlashLoRATTSState(
+                config=lora_tts_config,
+                draft_model=self.draft_model,
+                token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
+                block_size=self.block_size,
+                device=torch.device(self.device),
+            )
+            if self._lora_tts_static_buffers is not None:
+                # Check the config-derived buffer shapes against the loaded
+                # modules (raises on a mismatch) and hand the buffers to the
+                # state as the publish target.
+                self._lora_tts_state.adopt_static_buffers(
+                    self._lora_tts_static_buffers
+                )
+                _graph_runner = self.draft_model_runner.graph_runner
+                if self._lora_tts_draft_graphs:
+                    # Every captured batch size must fit the buffers. A graph
+                    # captured above max_bs records the no-adapter branch,
+                    # and real batches padded up to that size would be served
+                    # without adapters.
+                    _bs_list = (
+                        list(getattr(_graph_runner, "capture_bs", []) or [])
+                        if _graph_runner is not None
+                        else []
+                    )
+                    _over = [
+                        b
+                        for b in _bs_list
+                        if b > self._lora_tts_static_buffers.max_bs
+                    ]
+                    if _over:
+                        raise RuntimeError(
+                            "DFLASH LoRA-TTS: draft CUDA-graph batch sizes "
+                            f"{_over} exceed the static adapter buffer size "
+                            f"(max_bs={self._lora_tts_static_buffers.max_bs}). "
+                            "Lower --max-running-requests or "
+                            "--cuda-graph-max-bs."
+                        )
+                elif _graph_runner is not None:
+                    # Eager mode: the draft runner must not have captured any
+                    # graphs.
+                    raise RuntimeError(
+                        "DFLASH LoRA-TTS eager mode "
+                        "(--speculative-dflash-lora-tts-no-draft-graphs) "
+                        "requires the draft runner to have no CUDA graph "
+                        "runner."
+                    )
+            # freq <= 0: no buffers and nothing to check; the hook is absent
+            # from the draft graphs.
+
+        # Optional full-weight test-time speculation (dflash_tts.py).
+        self._tts_state: Optional[DFlashTTSState] = None
+        self._tts_forward: Optional[DFlashBlockForward] = None
+        self._tts_lm_head_rows: int = 0
+        # Hidden states of the block drafted in a firing round, carrying the
+        # autograd graph of the draft forward. The update consumes them once
+        # the target has verified the block.
+        self._tts_pending_hidden: Optional[torch.Tensor] = None
+        if tts_config.enable:
+            self._init_full_weight_tts(tts_config)
+
+    def _init_full_weight_tts(self, tts_config: DFlashTTSConfig) -> None:
+        """Set up full-weight TTS: validate the models and build its state."""
+        tp_size = int(get_tp_group().world_size)
+        target_model = self.target_worker.model_runner.model
+        self._tts_lm_head_rows = resolve_lm_head_rows(
+            getattr(target_model, "lm_head", None),
+            vocab_size=int(self.target_worker.model_runner.model_config.vocab_size),
+            tp_size=tp_size,
+        )
+        # The fused KV helper stacks a copy of the K/V projection weights when
+        # it is built, so it would keep projecting context tokens with the
+        # pretrained weights. Context K/V are materialized layer by layer
+        # from the live weights.
+        self._use_fused_kv_materialize = False
+        self._fused_kv_helper = None
+        self._tts_forward = DFlashBlockForward(
+            draft_model=self.draft_model,
+            token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
+            block_size=self.block_size,
+            tp_size=tp_size,
+        )
+        self._tts_state = DFlashTTSState(
+            draft_model=self.draft_model,
+            config=tts_config,
+            device=self.device,
+            target_model=target_model,
+            tp_size=tp_size,
+            tp_rank=self.tp_rank,
+        )
+        if self.tp_rank == 0:
+            logger.info(
+                "DFLASH full-weight TTS ready. draft_dtype=%s, draft_cuda_graph=%s, "
+                "draft_forward=differentiable block forward on update rounds, "
+                "context_kv=per-layer from live weights",
+                next(self.draft_model.parameters()).dtype,
+                self.draft_model_runner.graph_runner is not None,
+            )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -348,7 +686,49 @@ class DFlashWorker:
         # sliding-window path, the draft req->token view is rebuilt from committed
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
-        pass
+        if self._lora_tts_state is not None:
+            # flush_cache / release_memory_occupation expect GPU memory to be
+            # released immediately. Fence first, so that frees happen now
+            # instead of being deferred to a later round, which a sleeping
+            # server may never run.
+            self._lora_tts_state.wait_for_pending()
+            self._lora_tts_state._report_nonfinite()
+            self._lora_tts_state.prune_except([])
+            self._lora_tts_state.clear_captures()
+            # Also free the serving-dtype adapter pools, which the memory
+            # saver does not manage. This is safe because the fence and the
+            # prune above removed all per-request state; the pools are
+            # recreated on the next prefill that uses TTS.
+            self._lora_tts_state.release_pools()
+
+    def _fence_lora_tts_for_weight_update(self):
+        # An in-flight async TTS update reads the target's lm_head.weight
+        # without keeping it alive through record_stream. Fence before the
+        # weights are rewritten in place, so that the update does not read a
+        # partially written weight. Serving is not affected either way.
+        if self._lora_tts_state is not None:
+            self._lora_tts_state.wait_for_pending()
+
+    # These overrides delegate to the target worker, which is where
+    # __getattr__ would forward the calls anyway: update_weights_* never
+    # updates the draft model's own weights, so the scheduler's call on the
+    # draft worker updates the target a second time. The overrides exist to
+    # fence TTS before the update.
+    def update_weights_from_disk(self, recv_req):
+        self._fence_lora_tts_for_weight_update()
+        return self.target_worker.update_weights_from_disk(recv_req)
+
+    def update_weights_from_distributed(self, recv_req):
+        self._fence_lora_tts_for_weight_update()
+        return self.target_worker.update_weights_from_distributed(recv_req)
+
+    def update_weights_from_tensor(self, recv_req):
+        self._fence_lora_tts_for_weight_update()
+        return self.target_worker.update_weights_from_tensor(recv_req)
+
+    def update_weights_from_ipc(self, recv_req):
+        self._fence_lora_tts_for_weight_update()
+        return self.target_worker.update_weights_from_ipc(recv_req)
 
     def _gather_req_to_token_masked(
         self,
@@ -544,6 +924,28 @@ class DFlashWorker:
 
         bs = batch.batch_size()
 
+        if self._lora_tts_state is not None:
+            # Fence at the start of every decode round. With tp_size > 1 the
+            # embedding lookup below ends in a TP all-reduce on the main
+            # stream, while the previous round's update may still be running
+            # collectives on the side stream. Two streams interleaving
+            # collectives on one TP communicator can deadlock or corrupt
+            # data, so the update is fenced first. The second fence, inside
+            # the capture / publish block below, is then normally a no-op.
+            # fence_for_publish is the full wait_for_pending except with
+            # delayed publish, where it waits only for the older updates: the
+            # newest one keeps running through this round, publish reads the
+            # other pool generation, and with tp_size > 1 the update
+            # collectives use a dedicated communicator, so the two streams
+            # never share one.
+            self._lora_tts_state.fence_for_publish()
+
+        if self._tts_state is not None:
+            # Wait for the previous round's asynchronous optimizer step before
+            # any draft weight is read (the KV append and the draft forward
+            # below). This blocks the host only in the round after an update.
+            self._tts_state.wait_for_pending()
+
         # --- 1) Append any newly committed tokens into the draft KV cache.
         self._append_target_hidden_to_draft_kv(batch, draft_input)
 
@@ -597,9 +999,72 @@ class DFlashWorker:
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
+
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
+            if self._lora_tts_active():
+                # Publish the batch's adapters for the block forward and
+                # capture the replay inputs of the rows that are updated this
+                # round. Both happen before the draft forward, so that the
+                # capture matches what the draft model is about to run. They
+                # are inside this try block so that a partial publish is
+                # zeroed on failure (the static buffers persist across
+                # rounds). A TTS failure here, such as running out of memory
+                # for adapters, must not stop serving: the round is drafted
+                # without adapters.
+                try:
+                    # Fence the in-flight async update: publish reads the pool
+                    # rows that the update refreshes. With delayed publish the
+                    # fence is lag-1 and publish reads the newest fenced pool
+                    # generation. Normally a no-op after the fence at the
+                    # start of the round.
+                    self._lora_tts_state.fence_for_publish()
+                    # Take the indices from the host-side request list rather
+                    # than req_pool_indices.tolist(), which would synchronize
+                    # with the device on every round. Both hold the same
+                    # values in the same order.
+                    req_pool_idx_list = [
+                        int(r.req_pool_idx) for r in batch.reqs
+                    ]
+                    self._lora_tts_round_req_pool_idx_list = req_pool_idx_list
+                    self._lora_tts_state.capture_for_replay(
+                        req_pool_idx_list=req_pool_idx_list,
+                        block_input_embeds=noise_embedding,
+                        positions_2d=positions_2d,
+                        draft_prefix_lens_cpu=seq_lens_cpu,
+                        draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+                    )
+                    if noise_embedding.dtype != (
+                        self._lora_tts_state.serving_dtype
+                    ):
+                        raise RuntimeError(
+                            "DFlash LoRA-TTS serving dtype changed: "
+                            f"{self._lora_tts_state.serving_dtype} -> "
+                            f"{noise_embedding.dtype}."
+                        )
+                    self._lora_tts_state.publish_static(req_pool_idx_list)
+                except Exception as e:  # noqa: BLE001
+                    # Serve without adapters this round. Zero the static rows
+                    # so that the delta is exactly zero; stale rows could
+                    # apply other requests' adapters if the batch has changed.
+                    self._lora_tts_state._zero_static()
+                    self._lora_tts_state.clear_captures()
+                    if self._lora_tts_state.tp_size > 1:
+                        # A rank that serves without adapters while the others
+                        # serve with them computes a different forward and
+                        # breaks the TP-synchronized sampling, so fail instead.
+                        raise
+                    self._lora_tts_state.note_round_failure(
+                        f"capture/publish: {e}"
+                    )
+                    if not self._warned_lora_tts_serving_failed:
+                        logger.warning(
+                            "DFlash LoRA-TTS capture/publish failed (serving "
+                            "without adapters this round; warned once): %s",
+                            e,
+                        )
+                        self._warned_lora_tts_serving_failed = True
             if self.page_size == 1:
                 block_cache_loc = allocator.alloc(bs * self.block_size)
             else:
@@ -656,13 +1121,29 @@ class DFlashWorker:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
             )
 
-            with torch.inference_mode():
-                draft_logits_output = self.draft_model_runner.forward(
-                    forward_batch
-                ).logits_output
+            draft_logits_output = None
+            if self._tts_state is not None:
+                # Full-weight TTS drafts the block itself on the rounds in
+                # which an update fires. It returns None when the serving
+                # forward below should run.
+                draft_logits_output = self._tts_draft_forward(
+                    batch=batch,
+                    block_input_embeds=noise_embedding,
+                    positions_2d=positions_2d,
+                    draft_prefix_lens_cpu=seq_lens_cpu,
+                )
+            if draft_logits_output is None:
+                with torch.inference_mode():
+                    draft_logits_output = self.draft_model_runner.forward(
+                        forward_batch
+                    ).logits_output
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
+            # The static LoRA buffers persist across rounds. The hook applies
+            # them only to forwards whose token count is a whole number of
+            # blocks, and the next round's publish_static rewrites the rows
+            # for its own batch.
 
         draft_hidden = draft_logits_output.hidden_states
         if draft_hidden is None:
@@ -877,6 +1358,7 @@ class DFlashWorker:
         self,
         batch: ScheduleBatch,
         draft_input: DFlashDraftInput,
+        apply_kv_deltas: bool = True,
     ) -> None:
         """Materialize the target hidden-state features into the draft KV cache.
 
@@ -967,7 +1449,31 @@ class DFlashWorker:
                     f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
                 )
 
-            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+            kv_segments = None
+            if (
+                apply_kv_deltas
+                and self._lora_tts_active()
+                and self._lora_tts_state.has_kv_targets()
+            ):
+                # W_k / W_v carry adapters, which then also apply to this
+                # context-KV projection. Build per-request row segments; the
+                # rows are request-major (both the bs == 1 fast path and the
+                # masked gather flatten [bs, max_ctx] row-major). The tolist()
+                # synchronizes with the device, a cost paid only in this mode.
+                lens = ctx_lens.tolist()
+                idxs = [int(r.req_pool_idx) for r in batch.reqs]
+                kv_segments = []
+                off = 0
+                for ln, idx in zip(lens, idxs):
+                    if ln > 0:
+                        kv_segments.append((off, off + int(ln), idx))
+                    off += int(ln)
+
+            if (
+                kv_segments is None
+                and self._use_fused_kv_materialize
+                and self._fused_kv_helper is not None
+            ):
                 try:
                     self._append_target_hidden_fused(
                         ctx_hidden, ctx_positions, ctx_cache_loc
@@ -984,7 +1490,10 @@ class DFlashWorker:
                     )
             else:
                 self._append_target_hidden_sequential(
-                    ctx_hidden, ctx_positions, ctx_cache_loc
+                    ctx_hidden,
+                    ctx_positions,
+                    ctx_cache_loc,
+                    kv_segments=kv_segments,
                 )
 
         if self.use_compact_draft_cache:
@@ -1017,10 +1526,29 @@ class DFlashWorker:
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        kv_segments=None,
     ) -> None:
-        for layer in self.draft_model.layers:
+        for layer_id, layer in enumerate(self.draft_model.layers):
             attn = layer.self_attn
             k, v = attn.kv_proj_only(ctx_hidden)
+            if kv_segments:
+                # Context-KV role of the W_k / W_v adapters: each request's
+                # segment uses that request's adapters as they are at this
+                # append, and cached KV is not rewritten when they change
+                # later. The delta is applied before k_norm, as in the block
+                # forward. k and v are views of a temporary projection
+                # output, so the in-place adds are safe.
+                for start, end, req_idx in kv_segments:
+                    dk = self._lora_tts_state.context_kv_delta(
+                        req_idx, layer_id, "k", ctx_hidden[start:end]
+                    )
+                    if dk is not None:
+                        k[start:end] += dk.to(k.dtype)
+                    dv = self._lora_tts_state.context_kv_delta(
+                        req_idx, layer_id, "v", ctx_hidden[start:end]
+                    )
+                    if dv is not None:
+                        v[start:end] += dv.to(v.dtype)
             k = attn.apply_k_norm(k)
             k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
@@ -1109,6 +1637,212 @@ class DFlashWorker:
             model=self.target_worker.model_runner.model,
         )
 
+    def _tts_draft_forward(
+        self,
+        *,
+        batch: ScheduleBatch,
+        block_input_embeds: torch.Tensor,  # [bs, block_size, hidden]
+        positions_2d: torch.Tensor,  # [bs, block_size] int64
+        draft_prefix_lens_cpu: torch.Tensor,  # [bs] int32 on CPU
+    ) -> Optional[LogitsProcessorOutput]:
+        """Draft the block with the differentiable forward (full-weight TTS).
+
+        An update fires on this round if the stride says so and the request
+        is alone in the batch (the adapted weights belong to one request).
+        The block is then drafted under autograd, and its hidden states are
+        kept with their graph in `_tts_pending_hidden` for the update that
+        follows verification. Drafting continues from a detached copy, like
+        the output of the serving forward.
+
+        On every other round this method returns None, and the caller runs
+        the serving forward.
+
+        If this forward fails with tp_size 1, the round falls back to the
+        serving forward and counts as a failed update. With tp_size > 1 the
+        ranks must stay in step, so the error propagates.
+        """
+        state = self._tts_state
+        self._tts_pending_hidden = None
+        if not (state.should_fire() and batch.batch_size() == 1):
+            return None
+        try:
+            hidden = self._tts_forward(
+                input_embeds=block_input_embeds,
+                positions=positions_2d,
+                prefix_lens=draft_prefix_lens_cpu.tolist(),
+                # The host-side request list holds the same slots as
+                # batch.req_pool_indices without a device synchronization.
+                req_pool_indices=[int(r.req_pool_idx) for r in batch.reqs],
+                req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+            )
+        except Exception as e:  # noqa: BLE001
+            if state.tp_size > 1:
+                raise
+            state.note_step_failure(e)
+            return None
+        self._tts_pending_hidden = hidden
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            hidden_states=hidden.detach().reshape(-1, hidden.shape[-1]),
+        )
+
+    def _run_tts_post_verify(
+        self,
+        batch: ScheduleBatch,
+        target_logits: Optional[torch.Tensor],
+    ) -> None:
+        """Apply the pending full-weight TTS update and advance the stride.
+
+        The stride counter advances on every verify round, whether or not an
+        update fired.
+        """
+        state = self._tts_state
+        assert state is not None
+        draft_hidden = self._tts_pending_hidden
+        self._tts_pending_hidden = None
+        # An update for a request that has just finished would be discarded
+        # by the reset at the next prefill.
+        finished = all(req.finished() for req in batch.reqs)
+        if draft_hidden is not None and target_logits is not None and not finished:
+            lm_head = self.target_worker.model_runner.model.lm_head
+            try:
+                state.step(
+                    draft_hidden=draft_hidden,
+                    target_logits=target_logits,
+                    lm_head_weight=lm_head.weight[: self._tts_lm_head_rows],
+                )
+            except Exception as e:  # noqa: BLE001
+                if state.tp_size > 1:
+                    # A rank that skipped the update would hold different
+                    # weights and leave the ranks' collectives out of step.
+                    raise
+                # A failed update only costs adaptation; decoding continues.
+                state.note_step_failure(e)
+        state.advance()
+        if finished:
+            state.log_request_summary()
+
+    def _lora_tts_active(self) -> bool:
+        """True when TTS can update, i.e. when it has per-round work to do."""
+        state = self._lora_tts_state
+        return state is not None and state.cfg.freq > 0 and not state.is_disabled()
+
+    def _run_lora_tts_post_verify(
+        self,
+        batch: ScheduleBatch,
+        tts_target_logits: Optional[torch.Tensor],
+    ) -> None:
+        """Run the pending TTS updates, then advance the cadence counters and
+        release the adapters of finished requests.
+
+        `advance()` is called for every request on every verify round, whether
+        or not the request was captured or updated in that round (see
+        DFlashLoRATTSState.advance).
+        """
+        state = self._lora_tts_state
+        assert state is not None
+        # Reuse the request-slot list that _prepare built for this round;
+        # recompute it only if it does not match the batch.
+        req_pool_idx_list = self._lora_tts_round_req_pool_idx_list
+        self._lora_tts_round_req_pool_idx_list = None
+        if req_pool_idx_list is None or len(req_pool_idx_list) != batch.batch_size():
+            req_pool_idx_list = [int(i) for i in batch.req_pool_indices.tolist()]
+        finished_req_pool_indices = {
+            req_pool_idx
+            for row, req_pool_idx in enumerate(req_pool_idx_list)
+            if row < len(batch.reqs) and batch.reqs[row].finished()
+        }
+
+        if tts_target_logits is not None and state.has_pending_captures():
+            lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
+            lm_head_weight = self._lora_tts_lm_head_weight(
+                lm_head, vocab=int(tts_target_logits.shape[-1])
+            )
+            if lm_head_weight is not None:
+                state.run_tts_steps(
+                    target_logits=tts_target_logits,
+                    lm_head_weight=lm_head_weight,
+                    skip_req_pool_indices=finished_req_pool_indices,
+                )
+            else:
+                state.clear_captures()
+                state.disable(
+                    "unsupported target lm_head layout or dtype "
+                    "(see earlier warning for the specific reason)"
+                )
+        else:
+            state.clear_captures()
+
+        for req_pool_idx in req_pool_idx_list:
+            state.advance(req_pool_idx)
+            if req_pool_idx in finished_req_pool_indices:
+                state.drop(req_pool_idx)
+        # Retracted and aborted requests never report finished(); release
+        # their adapters and Adam state now rather than when the slot is
+        # reused.
+        state.prune_except(req_pool_idx_list)
+
+    def _lora_tts_lm_head_weight(
+        self, lm_head, *, vocab: int
+    ) -> Optional[torch.Tensor]:
+        """The target lm_head rows for the base vocab, or None if the head
+        layout is one LoRA-TTS does not support (logged once)."""
+        if lm_head is None or not hasattr(lm_head, "weight"):
+            return None
+        tp_size = self._lora_tts_state.tp_size if self._lora_tts_state else 1
+        weight = lm_head.weight
+        if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            # A quantized lm_head (e.g. fp8) would make the replay's F.linear
+            # raise on every update. Decline once here; returning None makes
+            # the caller disable TTS.
+            if not self._warned_lora_tts_lm_head:
+                logger.warning(
+                    "DFLASH LoRA-TTS: unsupported target lm_head dtype %s; "
+                    "skipping TTS steps.",
+                    weight.dtype,
+                )
+                self._warned_lora_tts_lm_head = True
+            return None
+        shard = getattr(lm_head, "shard_indices", None)
+        if shard is not None:
+            # Added vocabulary is not symmetric across ranks (added tokens
+            # are placed on the low ranks), so ranks could disagree on this
+            # check. That cannot happen at present, because server_args
+            # rejects --enable-lora / --lora-paths, the only source of added
+            # vocabulary, together with TTS. If that changes, this decision
+            # must be made collectively.
+            if int(shard.num_added_elements) > 0 or (
+                tp_size > 1
+                and int(shard.num_org_elements)
+                != int(shard.num_org_elements_padded)
+            ):
+                if not self._warned_lora_tts_lm_head:
+                    logger.warning(
+                        "DFLASH LoRA-TTS: added-vocab or padded lm_head shards "
+                        "are not supported; skipping TTS steps."
+                    )
+                    self._warned_lora_tts_lm_head = True
+                return None
+            weight = weight[: int(shard.num_org_elements)]
+        # At tp>1 each rank holds a contiguous vocab shard; the state gathers
+        # shard logits to full vocab, so the local rows must be vocab/tp.
+        expected_rows = vocab // tp_size if tp_size > 1 else vocab
+        if int(weight.shape[0]) != expected_rows or (
+            tp_size > 1 and vocab % tp_size != 0
+        ):
+            if not self._warned_lora_tts_lm_head:
+                logger.warning(
+                    "DFLASH LoRA-TTS: lm_head shard rows (%d) != expected "
+                    "(%d) for vocab %d at tp=%d; skipping TTS steps.",
+                    int(weight.shape[0]),
+                    expected_rows,
+                    vocab,
+                    tp_size,
+                )
+                self._warned_lora_tts_lm_head = True
+            return None
+        return weight
+
     def forward_batch_generation(
         self,
         batch: Union[ScheduleBatch, ModelWorkerBatch],
@@ -1124,6 +1858,21 @@ class DFlashWorker:
             return self.target_worker.forward_batch_generation(batch, **kwargs)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if self._lora_tts_state is not None:
+                # Full fence before a prefill. The collectives of an in-flight
+                # async update, on the side stream, must complete before the
+                # target's prefill forward enqueues collectives on the main
+                # stream of the same TP communicator; interleaving the two
+                # can deadlock or corrupt data. reset() below only releases
+                # the state of the slots in this batch and does not fence.
+                self._lora_tts_state.wait_for_pending()
+            if self._tts_state is not None:
+                # A prefill starts a new request: wait for any update still in
+                # flight, then restore the pretrained draft weights and clear
+                # the optimizer state before the request's context is written
+                # into the draft KV cache.
+                self._tts_state.reset()
+                self._tts_pending_hidden = None
             model_worker_batch = batch.get_model_worker_batch()
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
@@ -1159,6 +1908,12 @@ class DFlashWorker:
                     return x if x.dtype == torch.int32 else x.to(torch.int32)
                 return torch.tensor(x, dtype=torch.int32, device=device)
 
+            if self._lora_tts_state is not None:
+                # A prefill starts a new request in its slot: clear any
+                # adapters left by the slot's previous request.
+                self._lora_tts_state.reset(batch.req_pool_indices)
+                self._lora_tts_state.clear_captures()
+
             extend_seq_lens = _to_int32_device_tensor(
                 model_worker_batch.extend_seq_lens
             )
@@ -1172,7 +1927,13 @@ class DFlashWorker:
                     else _to_int32_device_tensor(model_worker_batch.extend_prefix_lens)
                 ),
             )
-            self._append_target_hidden_to_draft_kv(batch, draft_input)
+            # Prefill append: the k / v context deltas are always zero here
+            # (reset() has just cleared the slot's state, and a new request's
+            # B is zero), so skip the delta path and keep the fused KV
+            # materialization for the prompt.
+            self._append_target_hidden_to_draft_kv(
+                batch, draft_input, apply_kv_deltas=False
+            )
             batch.spec_info = draft_input
 
             return GenerationBatchResult(
@@ -1212,6 +1973,62 @@ class DFlashWorker:
             batch_result.can_run_cuda_graph,
         )
 
+        # Snapshot the target's verify logits before verify() modifies them in
+        # place (logit bias); they are the distillation target of TTS. Only
+        # the captured rows are copied, since copying the full
+        # [bs * block, vocab] tensor on every round would be large.
+        tts_target_logits: Optional[torch.Tensor] = None
+        if (
+            self._lora_tts_state is not None
+            and self._lora_tts_state.has_pending_captures()
+            and logits_output.next_token_logits is not None
+        ):
+            try:
+                with torch.inference_mode(False), torch.no_grad():
+                    capture_rows = torch.tensor(
+                        self._lora_tts_state.pending_capture_rows(),
+                        dtype=torch.int64,
+                        device=logits_output.next_token_logits.device,
+                    )
+                    # Only rows 0..block-2 are scored: block row k verifies
+                    # draft position k+1, and the last row's logits only
+                    # produce the bonus token. Advanced indexing already
+                    # returns a copy, which is independent of verify()'s
+                    # in-place changes and of the target CUDA graph reusing
+                    # its output buffer, so no extra clone is needed.
+                    tts_target_logits = logits_output.next_token_logits.view(
+                        batch.batch_size(), self.block_size, -1
+                    )[capture_rows, : self.block_size - 1].detach()
+            except Exception as e:  # noqa: BLE001
+                tts_target_logits = None
+                self._lora_tts_state.clear_captures()
+                if self._lora_tts_state.tp_size > 1:
+                    # A rank that skips the update while the others run its
+                    # collectives leaves the NCCL call order inconsistent.
+                    raise
+                self._lora_tts_state.note_round_failure(f"snapshot: {e}")
+                if not self._warned_lora_tts_serving_failed:
+                    logger.warning(
+                        "DFlash LoRA-TTS logits snapshot failed (skipping TTS "
+                        "this round; warned once): %s",
+                        e,
+                    )
+                    self._warned_lora_tts_serving_failed = True
+
+        # Full-weight TTS: the same snapshot for the block drafted with
+        # autograd in this round. The copy is taken outside inference mode
+        # because the loss saves it for backward.
+        full_tts_target_logits: Optional[torch.Tensor] = None
+        if (
+            self._tts_state is not None
+            and self._tts_pending_hidden is not None
+            and logits_output.next_token_logits is not None
+        ):
+            with torch.inference_mode(False), torch.no_grad():
+                full_tts_target_logits = (
+                    logits_output.next_token_logits.detach().clone()
+                )
+
         (
             new_bonus_tokens,
             commit_lens,
@@ -1238,6 +2055,30 @@ class DFlashWorker:
         self._append_target_hidden_to_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
+
+        if self._lora_tts_active():
+            try:
+                self._run_lora_tts_post_verify(batch, tts_target_logits)
+            except Exception as e:  # noqa: BLE001
+                if self._lora_tts_state.tp_size > 1:
+                    # Swallowing a failure on one rank would leave the NCCL
+                    # call order inconsistent across ranks.
+                    raise
+                # A TTS failure must not stop serving. Update failures are
+                # already counted inside run_tts_steps.
+                if not self._warned_lora_tts_serving_failed:
+                    logger.warning(
+                        "DFlash LoRA-TTS post-verify failed (skipping; "
+                        "warned once): %s",
+                        e,
+                    )
+                    self._warned_lora_tts_serving_failed = True
+
+        if self._tts_state is not None:
+            self._run_tts_post_verify(batch, full_tts_target_logits)
+
+        if self._accept_log is not None:
+            self._accept_log.write(batch.reqs, num_correct_drafts_per_req_cpu)
 
         num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:

@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the Test-Time Speculation paper."
+title: "Test-Time Speculation"
+authors:
+  - family-names: Kumar
+    given-names: Avinash
+  - family-names: Sanghavi
+    given-names: Sujay
+  - family-names: Das
+    given-names: Poulami
+url: "https://avinkumarut.github.io/TTS/"
+repository-code: "https://github.com/avinkumarUT/test-time-speculation"
+preferred-citation:
+  type: conference-paper
+  title: "Test-Time Speculation"
+  authors:
+    - family-names: Kumar
+      given-names: Avinash
+    - family-names: Sanghavi
+      given-names: Sujay
+    - family-names: Das
+      given-names: Poulami
+  collection-title: "Advances in Neural Information Processing Systems"
+  year: 2026
+  url: "https://arxiv.org/abs/2605.09329"

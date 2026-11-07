@@ -597,6 +597,68 @@ class ServerArgs:
     speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
 
+    # Objective of test-time speculation (TTS), for every speculator and mode.
+    speculative_tts_loss: str = "lk"
+    speculative_tts_lambda: float = 0.9  # used by the "kl" loss only
+    speculative_accept_log_dir: Optional[str] = None
+
+    # Speculative decoding (DFLASH full-weight test-time speculation, TTS).
+    # Updates the weights of the draft's block forward for a single in-flight request; see
+    # speculative/dflash_tts.py. The per-request LoRA mode below is the one
+    # for batched serving.
+    speculative_dflash_tts_enable: bool = False
+    speculative_dflash_tts_lr: float = 1e-5
+    speculative_dflash_tts_freq: int = 10
+    speculative_dflash_tts_pos_weight_gamma: float = 7.0
+    speculative_dflash_tts_kl_threshold: float = 0.0
+    speculative_dflash_tts_grad_clip: float = 1.0
+    speculative_dflash_tts_async: bool = True
+    speculative_dflash_tts_optimizer_dtype: str = "float32"
+
+    # Speculative decoding (DFLASH LoRA test-time speculation, TTS)
+    speculative_dflash_lora_tts_enable: bool = False
+    speculative_dflash_lora_tts_rank: int = 16
+    speculative_dflash_lora_tts_alpha: float = 32.0
+    # 1e-4 is the default for rank 16 / alpha 32; larger rates may reduce
+    # acceptance.
+    speculative_dflash_lora_tts_lr: float = 1e-4
+    speculative_dflash_lora_tts_freq: int = 1
+    speculative_dflash_lora_tts_steps: int = 1
+    speculative_dflash_lora_tts_pos_weight_gamma: float = 7.0
+    speculative_dflash_lora_tts_grad_clip: float = 1.0
+    speculative_dflash_lora_tts_targets: str = "q,o,gate_up,down"
+    speculative_dflash_lora_tts_layers: str = ""
+    speculative_dflash_lora_tts_async: bool = True
+    speculative_dflash_lora_tts_phase_stagger: bool = True
+    speculative_dflash_lora_tts_offload: bool = True
+    # Precision of the per-request optimizer state (adapter masters and Adam
+    # moments): "float32" or "bfloat16".
+    speculative_dflash_lora_tts_optimizer_dtype: str = "float32"
+    speculative_dflash_lora_tts_draft_graphs: bool = True
+    speculative_dflash_lora_tts_delayed_publish: bool = False
+    speculative_dflash_lora_tts_replay_chunk: int = 8
+
+    # Speculative decoding (EAGLE-3 test-time speculation, TTS)
+    speculative_eagle_tts_enable: bool = False
+    speculative_eagle_tts_lr: float = 1e-5
+    speculative_eagle_tts_freq: int = 10
+    speculative_eagle_tts_depth_decay: float = 0.8
+    speculative_eagle_tts_accum_steps: int = 1
+    speculative_eagle_tts_grad_clip: float = 1.0
+    speculative_eagle_tts_kl_threshold: float = 0.0
+    speculative_eagle_tts_correct_drafts_only: bool = False
+    speculative_eagle_tts_no_async: bool = False
+    # "full" updates the draft's own weights; "lora" updates low-rank adapters over
+    # `lora_targets` and freezes the base (see speculative/eagle_lora_tts.py).
+    speculative_eagle_tts_mode: str = "full"
+    speculative_eagle_tts_lora_rank: int = 16
+    speculative_eagle_tts_lora_alpha: float = 32.0
+    speculative_eagle_tts_lora_targets: str = ""
+    speculative_eagle_tts_per_request: bool = False
+    # Precision of the optimizer state (masters and Adam moments): "float32" or
+    # "bfloat16".
+    speculative_eagle_tts_optimizer_dtype: str = "float32"
+
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
     speculative_ngram_max_bfs_breadth: int = 10
@@ -3548,6 +3610,158 @@ class ServerArgs:
             )
         return False
 
+    def _validate_tts_loss_args(self) -> None:
+        if self.speculative_tts_loss not in ("lk", "kl"):
+            raise ValueError(
+                "--speculative-tts-loss must be 'lk' or 'kl', got "
+                f"{self.speculative_tts_loss!r}."
+            )
+        lam = float(self.speculative_tts_lambda)
+        if not (0.0 <= lam <= 1.0):
+            raise ValueError(f"--speculative-tts-lambda must be in [0, 1], got {lam}.")
+
+    def _validate_dflash_full_weight_tts(self):
+        """Validate `--speculative-dflash-tts-*` (full-weight DFLASH TTS).
+
+        Runs before the generic DFLASH defaults are applied, so an unset
+        `--max-running-requests` can be told apart from an explicit one.
+        """
+        if self.speculative_dflash_lora_tts_enable:
+            raise ValueError(
+                "--speculative-dflash-tts-enable (full-weight TTS) and "
+                "--speculative-dflash-lora-tts-enable (per-request LoRA TTS) "
+                "are mutually exclusive: both update the DFLASH draft model. "
+                "Enable one of them."
+            )
+        if self.max_running_requests is None:
+            self.max_running_requests = 1
+            logger.warning(
+                "Max running requests is set to 1 for DFLASH full-weight TTS, "
+                "which adapts the draft model to one request at a time."
+            )
+        elif int(self.max_running_requests) > 1:
+            raise ValueError(
+                "--speculative-dflash-tts-enable (full-weight TTS) serves a "
+                "single in-flight request, but --max-running-requests is "
+                f"{self.max_running_requests}. Full-weight TTS adapts one "
+                "shared set of draft weights to the request being generated "
+                "and restores them at every prefill, so concurrent requests "
+                "would overwrite each other's adaptation. Set "
+                "--max-running-requests 1, or use the per-request LoRA mode "
+                "(--speculative-dflash-lora-tts-enable) for batched serving."
+            )
+        if self.enable_lora or self.lora_paths:
+            raise ValueError(
+                "DFLASH full-weight TTS is incompatible with --enable-lora / "
+                "--lora-paths: the draft runner would also wrap the "
+                "drafter's linears with serving-LoRA layers."
+            )
+        if self.kv_cache_dtype not in (None, "auto"):
+            raise ValueError(
+                "DFLASH full-weight TTS requires --kv-cache-dtype auto: the "
+                "update reads the draft KV cache directly and does not "
+                "dequantize fp8 K/V."
+            )
+        if self.speculative_dflash_tts_optimizer_dtype not in ("float32", "bfloat16"):
+            raise ValueError(
+                "--speculative-dflash-tts-optimizer-dtype must be float32 or "
+                f"bfloat16, got {self.speculative_dflash_tts_optimizer_dtype!r}."
+            )
+        if float(self.speculative_dflash_tts_lr) < 0:
+            raise ValueError(
+                "--speculative-dflash-tts-lr must be non-negative, got "
+                f"{self.speculative_dflash_tts_lr}."
+            )
+        self._validate_tts_loss_args()
+        if int(self.speculative_dflash_tts_freq) < 1:
+            raise ValueError(
+                "--speculative-dflash-tts-freq must be >= 1, got "
+                f"{self.speculative_dflash_tts_freq}."
+            )
+        if float(self.speculative_dflash_tts_pos_weight_gamma) <= 0:
+            raise ValueError(
+                "--speculative-dflash-tts-pos-weight-gamma must be positive, "
+                f"got {self.speculative_dflash_tts_pos_weight_gamma}."
+            )
+        if float(self.speculative_dflash_tts_kl_threshold) < 0:
+            raise ValueError(
+                "--speculative-dflash-tts-kl-threshold must be non-negative, "
+                f"got {self.speculative_dflash_tts_kl_threshold}."
+            )
+
+    def _validate_eagle_tts(self):
+        """Validate `--speculative-eagle-tts-*` for configurations in which TTS
+        would be ignored or could not update.
+
+        Runs after the spec worker version and the draft length are resolved.
+        """
+        if self.disable_overlap_schedule or self.enable_multi_layer_eagle:
+            # TTS is implemented in the spec v2 EAGLE worker only. The other
+            # workers would serve without any update and without an error.
+            raise ValueError(
+                "--speculative-eagle-tts-enable requires the spec v2 EAGLE "
+                "worker, which is not used with --disable-overlap-schedule, "
+                "SGLANG_ENABLE_SPEC_V2=0, pipeline parallelism or a "
+                "multi-layer EAGLE draft."
+            )
+        if int(self.speculative_num_steps) < 2:
+            raise ValueError(
+                "--speculative-eagle-tts-enable requires "
+                "--speculative-num-steps >= 2, got "
+                f"{self.speculative_num_steps}: the loss is built from the "
+                "draft rollout, which has no step to train on otherwise."
+            )
+        if (
+            self.speculative_eagle_tts_per_request
+            and self.speculative_eagle_tts_mode != "lora"
+        ):
+            raise ValueError(
+                "--speculative-eagle-tts-per-request requires "
+                "--speculative-eagle-tts-mode lora, got "
+                f"{self.speculative_eagle_tts_mode!r}."
+            )
+        if int(self.speculative_eagle_tts_freq) < 1:
+            raise ValueError(
+                "--speculative-eagle-tts-freq must be >= 1, got "
+                f"{self.speculative_eagle_tts_freq}."
+            )
+        if int(self.speculative_eagle_tts_accum_steps) < 1:
+            raise ValueError(
+                "--speculative-eagle-tts-accum-steps must be >= 1, got "
+                f"{self.speculative_eagle_tts_accum_steps}."
+            )
+        if (
+            self.speculative_eagle_tts_per_request
+            and int(self.speculative_eagle_tts_accum_steps) > 1
+        ):
+            raise ValueError(
+                "--speculative-eagle-tts-accum-steps > 1 is not supported with "
+                "--speculative-eagle-tts-per-request: a request that starts in "
+                "a recycled slot would inherit the gradients accumulated for "
+                "the previous request."
+            )
+        if float(self.speculative_eagle_tts_lr) < 0:
+            raise ValueError(
+                "--speculative-eagle-tts-lr must be non-negative, got "
+                f"{self.speculative_eagle_tts_lr}."
+            )
+        self._validate_tts_loss_args()
+        if float(self.speculative_eagle_tts_depth_decay) <= 0:
+            raise ValueError(
+                "--speculative-eagle-tts-depth-decay must be positive, got "
+                f"{self.speculative_eagle_tts_depth_decay}."
+            )
+        if float(self.speculative_eagle_tts_kl_threshold) < 0:
+            raise ValueError(
+                "--speculative-eagle-tts-kl-threshold must be non-negative, "
+                f"got {self.speculative_eagle_tts_kl_threshold}."
+            )
+        if self.speculative_eagle_tts_optimizer_dtype not in ("float32", "bfloat16"):
+            raise ValueError(
+                "--speculative-eagle-tts-optimizer-dtype must be float32 or "
+                f"bfloat16, got {self.speculative_eagle_tts_optimizer_dtype!r}."
+            )
+
     def _handle_speculative_decoding(self):
         if (
             self.speculative_draft_model_path is not None
@@ -3560,6 +3774,36 @@ class ServerArgs:
 
         if self.speculative_algorithm is not None:
             self.speculative_algorithm = self.speculative_algorithm.upper()
+
+        if self.speculative_dflash_lora_tts_enable and (
+            self.speculative_algorithm != "DFLASH"
+        ):
+            raise ValueError(
+                "--speculative-dflash-lora-tts-enable requires "
+                "--speculative-algorithm DFLASH, got "
+                f"{self.speculative_algorithm!r}; the flag has no effect in "
+                "that mode."
+            )
+
+        if self.speculative_dflash_tts_enable and (
+            self.speculative_algorithm != "DFLASH"
+        ):
+            raise ValueError(
+                "--speculative-dflash-tts-enable requires "
+                "--speculative-algorithm DFLASH, got "
+                f"{self.speculative_algorithm!r}; the flag has no effect in "
+                "that mode."
+            )
+
+        if self.speculative_eagle_tts_enable and self.speculative_algorithm not in (
+            "EAGLE",
+            "EAGLE3",
+        ):
+            raise ValueError(
+                "--speculative-eagle-tts-enable requires --speculative-algorithm "
+                f"EAGLE or EAGLE3, got {self.speculative_algorithm!r}; the flag "
+                "has no effect in that mode."
+            )
 
         self.speculative_algorithm = _resolve_speculative_algorithm_alias(
             self.speculative_algorithm,
@@ -3601,6 +3845,109 @@ class ServerArgs:
                 raise ValueError(
                     "DFLASH speculative decoding requires setting --speculative-draft-model-path."
                 )
+
+            if self.speculative_dflash_tts_enable:
+                self._validate_dflash_full_weight_tts()
+
+            if self.speculative_dflash_lora_tts_enable:
+                if self.speculative_dflash_lora_tts_optimizer_dtype not in (
+                    "float32",
+                    "bfloat16",
+                ):
+                    raise ValueError(
+                        "--speculative-dflash-lora-tts-optimizer-dtype must be "
+                        "float32 or bfloat16, got "
+                        f"{self.speculative_dflash_lora_tts_optimizer_dtype!r}."
+                    )
+                # Validate the target list early (before workers spawn).
+                from sglang.srt.speculative.dflash_lora_tts import (
+                    parse_lora_tts_layers,
+                    parse_lora_tts_targets,
+                )
+
+                _tts_targets = parse_lora_tts_targets(
+                    self.speculative_dflash_lora_tts_targets
+                )
+                # Syntax check only: the draft model's layer count is not known
+                # until the worker loads its config. Out-of-range ids are
+                # rejected at state init, before any request is served.
+                parse_lora_tts_layers(
+                    self.speculative_dflash_lora_tts_layers, 1 << 20
+                )
+                if (
+                    any(t in ("k", "v") for t in _tts_targets)
+                    and not self.disable_radix_cache
+                ):
+                    raise ValueError(
+                        "DFLASH LoRA-TTS with k/v targets requires "
+                        "--disable-radix-cache: "
+                        "context KV is written with PER-REQUEST adapter "
+                        "deltas, so radix-shared prefix KV would leak one "
+                        "request's adapters into another's drafts."
+                    )
+                # tp_size >= 1 is supported: adapters are sharded like their
+                # base layers, the replay uses differentiable collectives and
+                # the loss a vocab all-gather (see DFLASH_LORA_TTS_DESIGN.md).
+                # With tp_size > 1, failures in the TTS path raise instead of
+                # being contained, because skipping work on one rank would
+                # leave the ranks' collectives out of step.
+                if self.enable_lora or self.lora_paths:
+                    raise ValueError(
+                        "DFLASH LoRA-TTS is incompatible with --enable-lora / "
+                        "--lora-paths: the draft runner would also wrap the "
+                        "drafter's linears with serving-LoRA layers."
+                    )
+                if int(self.speculative_dflash_lora_tts_replay_chunk) < 1:
+                    raise ValueError(
+                        "--speculative-dflash-lora-tts-replay-chunk must be "
+                        f">= 1, got {self.speculative_dflash_lora_tts_replay_chunk}."
+                    )
+                if (
+                    self.speculative_dflash_lora_tts_delayed_publish
+                    and not self.speculative_dflash_lora_tts_async
+                ):
+                    raise ValueError(
+                        "--speculative-dflash-lora-tts-delayed-publish "
+                        "requires async stepping; remove "
+                        "--speculative-dflash-lora-tts-no-async (sync mode "
+                        "completes training before publish anyway, so "
+                        "delaying publication buys nothing)."
+                    )
+                if int(self.speculative_dflash_lora_tts_rank) <= 0:
+                    raise ValueError(
+                        "--speculative-dflash-lora-tts-rank must be positive, got "
+                        f"{self.speculative_dflash_lora_tts_rank}."
+                    )
+                if int(self.speculative_dflash_lora_tts_steps) < 1:
+                    raise ValueError(
+                        "--speculative-dflash-lora-tts-steps must be >= 1, got "
+                        f"{self.speculative_dflash_lora_tts_steps}. "
+                        "(Use --speculative-dflash-lora-tts-freq 0 to disable "
+                        "training.)"
+                    )
+                self._validate_tts_loss_args()
+                if float(self.speculative_dflash_lora_tts_lr) <= 0:
+                    raise ValueError(
+                        "--speculative-dflash-lora-tts-lr must be positive, got "
+                        f"{self.speculative_dflash_lora_tts_lr}."
+                    )
+                if float(self.speculative_dflash_lora_tts_alpha) <= 0:
+                    raise ValueError(
+                        "--speculative-dflash-lora-tts-alpha must be positive, "
+                        f"got {self.speculative_dflash_lora_tts_alpha}."
+                    )
+                if float(self.speculative_dflash_lora_tts_pos_weight_gamma) <= 0:
+                    raise ValueError(
+                        "--speculative-dflash-lora-tts-pos-weight-gamma must be "
+                        "positive, got "
+                        f"{self.speculative_dflash_lora_tts_pos_weight_gamma}."
+                    )
+                if self.kv_cache_dtype not in (None, "auto"):
+                    raise ValueError(
+                        "DFLASH LoRA-TTS requires --kv-cache-dtype auto: the "
+                        "training replay reads the draft KV cache directly and "
+                        "does not dequantize fp8 K/V."
+                    )
 
             # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
             # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
@@ -3739,6 +4086,20 @@ class ServerArgs:
                     "Currently standalone speculative decoding does not support dp attention."
                 )
 
+            if (
+                self.speculative_eagle_tts_enable
+                and not self.speculative_eagle_tts_per_request
+                and self.max_running_requests is None
+            ):
+                # Without per-request adapters TTS adapts one set of weights
+                # to the request being generated.
+                self.max_running_requests = 1
+                logger.warning(
+                    "Max running requests is set to 1 for EAGLE3 TTS without "
+                    "--speculative-eagle-tts-per-request, which adapts the "
+                    "draft model to one request at a time."
+                )
+
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(
@@ -3841,6 +4202,102 @@ class ServerArgs:
             ):
                 raise ValueError(
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                )
+
+            if self.speculative_eagle_tts_enable and self.speculative_eagle_topk != 1:
+                # TTS pairs draft rollout step i with target verify row i+1,
+                # which is a well-defined correspondence only when the draft is
+                # a chain. At topk > 1 the rollout emits bs*topk rows per step
+                # against a target verify tensor of bs*num_draft_tokens rows,
+                # and a tree node is not identified by its rollout step alone.
+                raise ValueError(
+                    "--speculative-eagle-tts-enable requires "
+                    f"--speculative-eagle-topk 1, got {self.speculative_eagle_topk}. "
+                    "TTS distils onto the draft's chain of proposal "
+                    "distributions and has no defined position pairing for a "
+                    "topk > 1 draft tree."
+                )
+
+            if self.speculative_eagle_tts_enable:
+                self._validate_eagle_tts()
+
+            if self.speculative_eagle_tts_enable and self.enable_dp_attention:
+                # TTS makes the TP collectives differentiable by patching the
+                # module-level `tensor_model_parallel_all_*` symbols. Under DP
+                # attention those are not the functions that run:
+                # RowParallelLinear calls the bound
+                # `get_attention_tp_group().all_reduce`, and the logits
+                # processor's dp path scatters into a new tensor, which cuts
+                # the autograd tape. The patch would install without error,
+                # yet every parameter upstream of o_proj/down_proj would
+                # receive a zero gradient.
+                raise ValueError(
+                    "--speculative-eagle-tts-enable is not supported with "
+                    "--enable-dp-attention: the draft's TP collectives would "
+                    "not be differentiable and the draft would silently train "
+                    "on zero gradients."
+                )
+
+            if self.speculative_eagle_tts_enable and self.speculative_adaptive:
+                # Adaptive spec params re-capture the draft CUDA graphs at
+                # runtime, when TTS state is already live. On a firing round
+                # `draft_forward` disables the draft's graph runners and runs
+                # an eager rollout with autograd, and the training step's
+                # finite-loss check is a host sync; none of this can run
+                # inside `torch.cuda.graph` capture.
+                raise ValueError(
+                    "--speculative-eagle-tts-enable is not supported with "
+                    "--speculative-adaptive: adaptive re-captures the draft "
+                    "CUDA graphs at runtime, which cannot be done while TTS is "
+                    "active."
+                )
+
+            if (
+                self.speculative_eagle_tts_enable
+                and not self.speculative_eagle_tts_per_request
+                and int(self.max_running_requests) > 1
+            ):
+                logger.warning(
+                    "EAGLE3 TTS without --speculative-eagle-tts-per-request "
+                    "adapts one set of weights that all in-flight requests "
+                    "share and that is reset whenever a request starts. It is "
+                    "meant for one request at a time (--max-running-requests "
+                    f"1, got {self.max_running_requests}). For batched serving "
+                    "use --speculative-eagle-tts-mode lora with "
+                    "--speculative-eagle-tts-per-request."
+                )
+
+            if self.speculative_eagle_tts_enable and (
+                self.speculative_eagle_tts_mode == "lora"
+            ):
+                from sglang.srt.speculative.eagle_lora_tts import (
+                    DEFAULT_LORA_TARGETS,
+                    parse_lora_targets,
+                )
+
+                if not self.speculative_eagle_tts_lora_targets:
+                    self.speculative_eagle_tts_lora_targets = DEFAULT_LORA_TARGETS
+                # Validate early, before workers spawn.
+                parse_lora_targets(self.speculative_eagle_tts_lora_targets)
+                if self.speculative_eagle_tts_lora_rank <= 0:
+                    raise ValueError(
+                        "--speculative-eagle-tts-lora-rank must be positive, got "
+                        f"{self.speculative_eagle_tts_lora_rank}."
+                    )
+                if self.speculative_eagle_tts_lora_alpha <= 0:
+                    raise ValueError(
+                        "--speculative-eagle-tts-lora-alpha must be positive, got "
+                        f"{self.speculative_eagle_tts_lora_alpha}."
+                    )
+            elif (
+                self.speculative_eagle_tts_enable
+                and self.speculative_eagle_tts_lora_targets
+            ):
+                raise ValueError(
+                    "--speculative-eagle-tts-lora-targets was set but "
+                    "--speculative-eagle-tts-mode is "
+                    f"{self.speculative_eagle_tts_mode!r}; the flag has no effect "
+                    "in that mode."
                 )
 
         if self.speculative_algorithm == "NGRAM":
@@ -5883,6 +6340,276 @@ class ServerArgs:
             default=ServerArgs.speculative_draft_window_size,
         )
         parser.add_argument(
+            "--speculative-accept-log-dir",
+            type=str,
+            default=ServerArgs.speculative_accept_log_dir,
+            help="Write a per-request acceptance log for DFLASH, and for EAGLE3 "
+            "with --speculative-eagle-topk 1, with or without TTS, to this "
+            "directory: <rid>.txt with one line per verify round, that round's "
+            "number of correct drafts. It adds host synchronization and file "
+            "I/O to the scheduler loop, so do not measure throughput with it.",
+        )
+        parser.add_argument(
+            "--speculative-tts-loss",
+            type=str,
+            choices=["lk", "kl"],
+            default=ServerArgs.speculative_tts_loss,
+            help="Objective of test-time speculation (TTS), for every speculator "
+            "and mode. 'lk': -log(sum_x min(p(x), q(x))), the negative log of "
+            "the speculative acceptance probability (1 - total variation "
+            "distance). 'kl': lambda*KL(target||draft) + (1-lambda)*self-CE.",
+        )
+        parser.add_argument(
+            "--speculative-tts-lambda",
+            type=float,
+            default=ServerArgs.speculative_tts_lambda,
+            help="Mixing weight of the 'kl' TTS loss, in [0, 1]. Not used by the "
+            "'lk' loss.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-tts-enable",
+            action="store_true",
+            default=ServerArgs.speculative_dflash_tts_enable,
+            help="Enable full-weight test-time speculation (TTS) for the DFLASH "
+            "draft model: the weights of the draft's block forward are updated online from the "
+            "target's verify logits while a response is generated, and are "
+            "restored at the start of every request. Serves a single "
+            "in-flight request (--max-running-requests 1, which is also the "
+            "default in this mode); use --speculative-dflash-lora-tts-enable "
+            "for batched serving. Requires --speculative-algorithm DFLASH.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-tts-lr",
+            type=float,
+            default=ServerArgs.speculative_dflash_tts_lr,
+            help="Adam learning rate of the DFLASH full-weight TTS updates.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-tts-freq",
+            type=int,
+            default=ServerArgs.speculative_dflash_tts_freq,
+            help="Update stride of DFLASH full-weight TTS, in verify rounds: "
+            "the draft weights are updated on every N-th round of a request, "
+            "starting with its first (1 = every round). Must be >= 1.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-tts-pos-weight-gamma",
+            type=float,
+            default=ServerArgs.speculative_dflash_tts_pos_weight_gamma,
+            help="Decay of the per-position loss weights in DFLASH full-weight "
+            "TTS: drafted position k of a block (k = 0, 1, ...) is weighted "
+            "by exp(-k / gamma), normalized over the block. Must be positive.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-tts-kl-threshold",
+            type=float,
+            default=ServerArgs.speculative_dflash_tts_kl_threshold,
+            help="Skip a DFLASH full-weight TTS update when the divergence term "
+            "of its block's loss is below this threshold. 0 disables the gate. "
+            "A positive value synchronizes with the GPU on every update "
+            "round.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-tts-grad-clip",
+            type=float,
+            default=ServerArgs.speculative_dflash_tts_grad_clip,
+            help="Maximum global gradient norm of a DFLASH full-weight TTS "
+            "update. A value <= 0 disables clipping.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-tts-no-async",
+            action="store_false",
+            dest="speculative_dflash_tts_async",
+            default=ServerArgs.speculative_dflash_tts_async,
+            help="Run the optimizer step of DFLASH full-weight TTS on the main "
+            "CUDA stream. By default it runs on a side stream and the host "
+            "waits for it before the next draft forward.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-tts-optimizer-dtype",
+            type=str,
+            choices=["float32", "bfloat16"],
+            default=ServerArgs.speculative_dflash_tts_optimizer_dtype,
+            help="Precision in which DFLASH full-weight TTS stores its optimizer "
+            "state. The arithmetic of a step is float32 and the draft weights "
+            "are served in their own dtype in both modes, and the draft model "
+            "keeps its CUDA graphs. float32: Adam steps on a float32 master "
+            "copy of the draft weights, with float32 moments, and every update "
+            "writes the masters back into the served weights; updates smaller "
+            "than the spacing of a served weight accumulate in the master. "
+            "bfloat16: the weights are their own master and the moments are "
+            "bfloat16; a step widens them to float32 and rounds once when it "
+            "stores the results, with half the standing memory; updates "
+            "smaller than the bfloat16 spacing of a weight are lost, and the "
+            "second moment stops decaying. bfloat16 requires a bfloat16 draft "
+            "model.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-enable",
+            action="store_true",
+            default=ServerArgs.speculative_dflash_lora_tts_enable,
+            help="Enable test-time speculation (TTS) for the DFLASH draft model. "
+            "Each in-flight request gets its own LoRA adapters on the draft "
+            "model, updated online from the target's verify logits while the "
+            "response is generated. Requires --speculative-algorithm DFLASH; "
+            "CUDA graphs stay enabled for both the target and the draft.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-rank",
+            type=int,
+            default=ServerArgs.speculative_dflash_lora_tts_rank,
+            help="LoRA rank of the per-request DFLASH TTS adapters.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-alpha",
+            type=float,
+            default=ServerArgs.speculative_dflash_lora_tts_alpha,
+            help="LoRA alpha of the DFLASH TTS adapters. The adapter output is "
+            "scaled by alpha / rank.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-lr",
+            type=float,
+            default=ServerArgs.speculative_dflash_lora_tts_lr,
+            help="Adam learning rate of the DFLASH TTS adapter updates.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-freq",
+            type=int,
+            default=ServerArgs.speculative_dflash_lora_tts_freq,
+            help="Update stride of DFLASH TTS: each request's adapters are "
+            "updated once every N verify rounds (1 = every round). With a "
+            "value <= 0 the adapters are never updated and drafting is "
+            "unchanged.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-steps",
+            type=int,
+            default=ServerArgs.speculative_dflash_lora_tts_steps,
+            help="Number of Adam steps per DFLASH TTS update. Each step re-runs "
+            "the draft block forward with the current adapters. Must be >= 1.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-pos-weight-gamma",
+            type=float,
+            default=ServerArgs.speculative_dflash_lora_tts_pos_weight_gamma,
+            help="Decay of the per-position loss weights in DFLASH TTS: scored "
+            "position k of a block (k = 0, 1, ...) is weighted by "
+            "exp(-k / gamma), normalized over the block. Must be positive.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-grad-clip",
+            type=float,
+            default=ServerArgs.speculative_dflash_lora_tts_grad_clip,
+            help="Maximum gradient norm per request for DFLASH TTS updates. "
+            "A value <= 0 disables clipping.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-no-async",
+            action="store_false",
+            dest="speculative_dflash_lora_tts_async",
+            default=ServerArgs.speculative_dflash_lora_tts_async,
+            help="Run DFLASH TTS updates synchronously on the main CUDA stream. "
+            "By default they run asynchronously on a side stream and overlap "
+            "the next round's serving. In synchronous mode an update with a "
+            "non-finite loss is skipped; in asynchronous mode non-finite "
+            "gradients are zeroed instead.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-no-phase-stagger",
+            action="store_false",
+            dest="speculative_dflash_lora_tts_phase_stagger",
+            default=ServerArgs.speculative_dflash_lora_tts_phase_stagger,
+            help="Disable phase staggering of DFLASH TTS updates. By default, "
+            "when the update stride is greater than 1, requests are updated "
+            "on different rounds (request phase = req_pool_idx %% freq), "
+            "which spreads the update work and its peak memory over the "
+            "rounds. With this flag every request is updated when its round "
+            "count is a multiple of the stride, so requests admitted together "
+            "are updated on the same round.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-no-offload",
+            action="store_false",
+            dest="speculative_dflash_lora_tts_offload",
+            default=ServerArgs.speculative_dflash_lora_tts_offload,
+            help="Keep the per-request DFLASH TTS optimizer state (master adapter "
+            "weights and Adam moments) on the GPU. By default this state is "
+            "held in pinned CPU memory between updates and copied to the GPU "
+            "only for an update, which reduces the GPU memory per request; "
+            "the resulting updates are the same.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-optimizer-dtype",
+            type=str,
+            choices=["float32", "bfloat16"],
+            default=ServerArgs.speculative_dflash_lora_tts_optimizer_dtype,
+            help="Precision in which DFLASH TTS stores each request's optimizer "
+            "state (the master adapter weights and the two Adam moments). "
+            "Adapters are served in the draft's dtype and an update computes "
+            "in float32 in both modes. float32: the state is float32, so "
+            "updates smaller than the spacing of a served adapter weight "
+            "accumulate in the master. bfloat16: the state is bfloat16, which "
+            "halves its memory and, with offload, its host-GPU transfers; an "
+            "update widens it to float32 and rounds it once when it is stored, "
+            "so updates smaller than the bfloat16 spacing of a weight are lost "
+            "and the second moment effectively does not decay. bfloat16 "
+            "requires a bfloat16 draft model and works with and without "
+            "--speculative-dflash-lora-tts-no-offload.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-no-draft-graphs",
+            action="store_false",
+            dest="speculative_dflash_lora_tts_draft_graphs",
+            default=ServerArgs.speculative_dflash_lora_tts_draft_graphs,
+            help="Run the DFLASH draft model eagerly when TTS is enabled. By "
+            "default the draft keeps its CUDA graphs: the graphs read the "
+            "adapters from fixed buffers whose contents are rewritten every "
+            "round.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-delayed-publish",
+            action="store_true",
+            default=ServerArgs.speculative_dflash_lora_tts_delayed_publish,
+            help="Delayed publish for DFLASH TTS: adapters updated at verify "
+            "round N are used for drafting from round N+2 instead of N+1, so "
+            "that an asynchronous update does not block the next round. Off "
+            "by default. Requires asynchronous updates and doubles the memory "
+            "of the per-request serving adapter rows. With tp_size > 1 a "
+            "dedicated NCCL communicator is created for the update "
+            "collectives; if that is not possible (the torch.distributed "
+            "world is not exactly the TP group), the option is turned off "
+            "with a warning.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-replay-chunk",
+            type=int,
+            default=ServerArgs.speculative_dflash_lora_tts_replay_chunk,
+            help="Maximum number of requests whose DFLASH TTS updates are "
+            "replayed together. Lower it to reduce the transient memory of an "
+            "update.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-targets",
+            type=str,
+            default=ServerArgs.speculative_dflash_lora_tts_targets,
+            help="Comma-separated list of DFLASH draft projections that carry "
+            "TTS adapters. Valid values: q, k, v, o, gate_up, down. The "
+            "default is q,o,gate_up,down. Including k or v also applies the "
+            "adapters to the context-KV projection and requires "
+            "--disable-radix-cache; see DFLASH_LORA_TTS_DESIGN.md.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-lora-tts-layers",
+            type=str,
+            default=ServerArgs.speculative_dflash_lora_tts_layers,
+            help="DFLASH draft layers that carry TTS adapters. '' or 'all' "
+            "selects every layer (default), 'last<K>' the top K layers, "
+            "'first<K>' the bottom K layers; a comma-separated list of layer "
+            "ids such as '0,2,4' selects exactly those. The other layers run "
+            "without adapters.",
+        )
+        parser.add_argument(
             "--speculative-moe-runner-backend",
             type=str,
             choices=MOE_RUNNER_BACKEND_CHOICES,
@@ -5902,6 +6629,144 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+
+        # Speculative decoding (EAGLE-3 test-time speculation, TTS)
+        parser.add_argument(
+            "--speculative-eagle-tts-enable",
+            action="store_true",
+            default=ServerArgs.speculative_eagle_tts_enable,
+            help="Enable Test-Time Speculation (TTS) for EAGLE/EAGLE-3: update the "
+            "draft model online during decoding, using the target model's "
+            "verification distributions at the drafted positions.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-lr",
+            type=float,
+            default=ServerArgs.speculative_eagle_tts_lr,
+            help="Learning rate of the Adam optimizer used for EAGLE-3 TTS updates.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-freq",
+            type=int,
+            default=ServerArgs.speculative_eagle_tts_freq,
+            help="Update stride: a TTS update fires once every this many decode "
+            "rounds. Larger values amortize the update cost over more rounds.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-depth-decay",
+            type=float,
+            default=ServerArgs.speculative_eagle_tts_depth_decay,
+            help="Depth weighting of the TTS loss: a drafted position at depth d "
+            "has weight decay**d. Shallow positions gate every position behind "
+            "them, so they are weighted more. A value of 1.0 or more weights "
+            "all positions equally.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-accum-steps",
+            type=int,
+            default=ServerArgs.speculative_eagle_tts_accum_steps,
+            help="Number of firing rounds whose gradients are accumulated per "
+            "optimizer step. A single round supplies only a few token "
+            "positions, so accumulating reduces gradient noise. Values above 1 "
+            "are not supported with --speculative-eagle-tts-per-request.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-grad-clip",
+            type=float,
+            default=ServerArgs.speculative_eagle_tts_grad_clip,
+            help="Gradient-norm clip for the TTS update (0 disables). With "
+            "--speculative-eagle-tts-per-request the norm is computed and "
+            "clipped per request.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-kl-threshold",
+            type=float,
+            default=ServerArgs.speculative_eagle_tts_kl_threshold,
+            help="Skip the TTS update when the draft/target divergence term of "
+            "the loss is below this threshold (0 disables the gate).",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-correct-drafts-only",
+            action="store_true",
+            default=ServerArgs.speculative_eagle_tts_correct_drafts_only,
+            help="Train only on the correct drafts, i.e. the drafted positions "
+            "the target accepted. By default every drafted position enters "
+            "the TTS loss, including the first rejected one.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-no-async",
+            action="store_true",
+            default=ServerArgs.speculative_eagle_tts_no_async,
+            help="Run the TTS optimizer step synchronously instead of on a side "
+            "CUDA stream.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-per-request",
+            action="store_true",
+            default=ServerArgs.speculative_eagle_tts_per_request,
+            help="Give every concurrent request its own LoRA adapter slot, so "
+            "that requests in a batch adapt independently. Without it all "
+            "requests share one adapter, which is reset whenever a request "
+            "starts. Requires --speculative-eagle-tts-mode lora. The adapter "
+            "pool has one slot per request allowed by --max-running-requests, "
+            "so set that to the concurrency you intend to serve.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-optimizer-dtype",
+            type=str,
+            choices=["float32", "bfloat16"],
+            default=ServerArgs.speculative_eagle_tts_optimizer_dtype,
+            help="Precision in which EAGLE3 TTS stores its optimizer state (the "
+            "master copy of the trained tensors and the two Adam moments). The "
+            "trained tensors are served in the draft's dtype and an update "
+            "computes in float32 in both modes. float32: float32 masters and "
+            "moments, written back into the served tensors; updates smaller "
+            "than the spacing of a served weight accumulate in the master. "
+            "bfloat16: the served bfloat16 tensors are their own masters and "
+            "the moments are bfloat16, which reduces the state of an adapter "
+            "element from 14 to 6 bytes; every update is rounded once when it "
+            "is stored, so updates smaller than the bfloat16 spacing of a "
+            "weight are lost and the second moment effectively does not decay. "
+            "bfloat16 requires a bfloat16 draft model.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-mode",
+            type=str,
+            choices=["full", "lora"],
+            default=ServerArgs.speculative_eagle_tts_mode,
+            help="Which weights TTS updates. 'lora' updates low-rank adapters "
+            "over --speculative-eagle-tts-lora-targets and keeps the other "
+            "weights frozen, except that without "
+            "--speculative-eagle-tts-per-request it also trains "
+            "post_attention_layernorm and the final norm; together with "
+            "--speculative-eagle-tts-per-request it is the configuration for "
+            "batched serving. 'full' updates the "
+            "speculator's own weights for a single request and restores them "
+            "when the next request starts.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-lora-rank",
+            type=int,
+            default=ServerArgs.speculative_eagle_tts_lora_rank,
+            help="Rank of the LoRA adapters (--speculative-eagle-tts-mode lora).",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-lora-alpha",
+            type=float,
+            default=ServerArgs.speculative_eagle_tts_lora_alpha,
+            help="LoRA alpha; the adapter output is scaled by alpha/rank.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-tts-lora-targets",
+            type=str,
+            default=ServerArgs.speculative_eagle_tts_lora_targets,
+            help="Comma-separated draft matrices that carry a LoRA adapter. "
+            "Valid: q,k,v,o,gate_up,down,fc,lm_head. Empty selects the default "
+            "set (q,o,gate_up,down,lm_head). Adapting k or v makes "
+            "already-cached draft K/V inconsistent with later entries and is "
+            "not recommended. fc runs outside the differentiated rollout, so "
+            "an adapter on it receives no gradient.",
         )
 
         # Speculative decoding (ngram)

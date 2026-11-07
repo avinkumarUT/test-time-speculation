@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 350" width="900" height="350" role="img" aria-label="TTS timeline for DFlash: speculate-verify rounds run on the main stream. Once every S rounds, after a verify pass, one gradient step on the request's LoRA adapter is dispatched to a side stream, where it overlaps the next round; the updated adapter is used for drafting from the round after that.">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#1d2136"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#2c9a62"/>
+    </marker>
+  </defs>
+
+  <!-- card -->
+  <rect x="1" y="1" width="898" height="348" rx="16" fill="#fbfaf7" stroke="#d9d4c7" stroke-width="2"/>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#1d2136">
+
+    <!-- update stride bracket -->
+    <path d="M150 44V36H570V44" fill="none" stroke="#5b6079" stroke-width="2" stroke-linejoin="round"/>
+    <text x="360" y="27" font-size="12" font-weight="600" text-anchor="middle" fill="#5b6079">update stride S</text>
+
+    <!-- row labels -->
+    <text x="28" y="112" font-size="14" font-weight="700">Main stream</text>
+    <text x="28" y="130" font-size="12" fill="#5b6079">speculate, verify</text>
+    <text x="28" y="246" font-size="14" font-weight="700">Side stream</text>
+    <text x="28" y="264" font-size="12" fill="#5b6079">TTS update</text>
+
+    <!-- lane guides -->
+    <path d="M150 144H872" stroke="#d9d4c7" stroke-width="2" stroke-dasharray="2 6" stroke-linecap="round"/>
+    <path d="M150 278H872" stroke="#d9d4c7" stroke-width="2" stroke-dasharray="2 6" stroke-linecap="round"/>
+
+    <!-- rounds on the main stream: draft (orange) + verify (navy) -->
+    <g font-size="12" font-weight="600" text-anchor="middle">
+      <g>
+        <rect x="150" y="90" width="38" height="44" rx="8" fill="#e07a2c"/>
+        <rect x="190" y="90" width="62" height="44" rx="8" fill="#2b3050"/>
+        <text x="169" y="117" fill="#ffffff">D</text><text x="221" y="117" fill="#ffffff">Verify</text>
+        <text x="201" y="78" fill="#5b6079" font-weight="500">round t</text>
+      </g>
+      <g>
+        <rect x="270" y="90" width="38" height="44" rx="8" fill="#e07a2c"/>
+        <rect x="310" y="90" width="62" height="44" rx="8" fill="#2b3050"/>
+        <text x="289" y="117" fill="#ffffff">D</text><text x="341" y="117" fill="#ffffff">Verify</text>
+        <text x="321" y="78" fill="#5b6079" font-weight="500">t + 1</text>
+      </g>
+      <g>
+        <rect x="390" y="90" width="38" height="44" rx="8" fill="#e07a2c" stroke="#2c9a62" stroke-width="4"/>
+        <rect x="432" y="90" width="62" height="44" rx="8" fill="#2b3050"/>
+        <text x="409" y="117" fill="#ffffff">D</text><text x="463" y="117" fill="#ffffff">Verify</text>
+        <text x="441" y="78" fill="#5b6079" font-weight="500">t + 2</text>
+      </g>
+      <text x="532" y="118" font-size="20" fill="#5b6079">· · ·</text>
+      <g>
+        <rect x="570" y="90" width="38" height="44" rx="8" fill="#e07a2c"/>
+        <rect x="610" y="90" width="62" height="44" rx="8" fill="#2b3050"/>
+        <text x="589" y="117" fill="#ffffff">D</text><text x="641" y="117" fill="#ffffff">Verify</text>
+        <text x="621" y="78" fill="#5b6079" font-weight="500">t + S</text>
+      </g>
+      <g>
+        <rect x="690" y="90" width="38" height="44" rx="8" fill="#e07a2c"/>
+        <rect x="730" y="90" width="62" height="44" rx="8" fill="#2b3050"/>
+        <text x="709" y="117" fill="#ffffff">D</text><text x="761" y="117" fill="#ffffff">Verify</text>
+        <text x="741" y="78" fill="#5b6079" font-weight="500">t + S + 1</text>
+      </g>
+    </g>
+
+    <!-- hand-off: verified block goes down to the side stream -->
+    <path d="M221 136V214" stroke="#1d2136" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+    <text x="210" y="166" font-size="12" text-anchor="end">verified block,</text>
+    <text x="210" y="182" font-size="12" text-anchor="end">target logits</text>
+
+    <!-- the update, overlapping the next round -->
+    <rect x="204" y="218" width="182" height="50" rx="10" fill="#3fb97a"/>
+    <text x="295" y="239" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">gradient step on this</text>
+    <text x="295" y="256" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">request's LoRA adapter</text>
+
+    <!-- publish: updated adapter used from round t + 2 -->
+    <path d="M386 243H409V140" stroke="#2c9a62" stroke-width="2.5" fill="none" marker-end="url(#arrow-green)"/>
+    <text x="420" y="176" font-size="12">updated adapter drafts</text>
+    <text x="420" y="192" font-size="12">from round t + 2</text>
+
+    <!-- the next update, S rounds later -->
+    <path d="M641 136V214" stroke="#1d2136" stroke-width="2.5" fill="none" marker-end="url(#arrow)" opacity="0.55"/>
+    <rect x="624" y="218" width="182" height="50" rx="10" fill="#3fb97a" opacity="0.45"/>
+    <text x="715" y="248" font-size="12" font-weight="700" text-anchor="middle" fill="#1d2136" opacity="0.75">next update</text>
+
+    <!-- legend -->
+    <g font-size="12" fill="#5b6079">
+      <rect x="150" y="306" width="16" height="16" rx="4" fill="#e07a2c"/>
+      <text x="172" y="319">draft (speculator)</text>
+      <rect x="300" y="306" width="16" height="16" rx="4" fill="#2b3050"/>
+      <text x="322" y="319">verify (target model)</text>
+      <rect x="470" y="306" width="16" height="16" rx="4" fill="#3fb97a"/>
+      <text x="492" y="319">TTS update, overlapping serving</text>
+    </g>
+  </g>
+</svg>
